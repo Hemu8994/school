@@ -266,7 +266,7 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// ==================== DEBUG ROUTE - REMOVE AFTER TESTING ====================
+// ==================== DEBUG ROUTE ====================
 app.post('/api/debug-login', async (req, res) => {
   try {
     const { phone, pin } = req.body;
@@ -426,12 +426,15 @@ app.get('/api/students', authenticate, async (req, res) => {
     const { class: className, search } = req.query;
     let query = { isActive: true };
 
+    // Role-based filtering
     if (req.user.role === 'teacher') {
       const teacher = await User.findById(req.user.userId);
-      query.className = teacher.classId;
+      if (teacher) query.className = teacher.classId;
     } else if (req.user.role === 'parent') {
       const parent = await User.findById(req.user.userId);
-      query._id = { $in: parent.childrenIds };
+      if (parent && parent.childrenIds.length > 0) {
+        query._id = { $in: parent.childrenIds };
+      }
     }
 
     if (className && className !== 'All') {
@@ -446,6 +449,7 @@ app.get('/api/students', authenticate, async (req, res) => {
     res.json(students);
 
   } catch (error) {
+    console.error('Error fetching students:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -489,6 +493,9 @@ app.put('/api/students/:id', authenticate, isAdmin, async (req, res) => {
       req.body,
       { new: true }
     );
+    if (!student) {
+      return res.status(404).json({ error: 'Student not found' });
+    }
     res.json(student);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -513,7 +520,7 @@ app.post('/api/payments', authenticate, async (req, res) => {
       return res.status(404).json({ error: 'Student not found' });
     }
 
-    const contribution = await Contribution.findById(contributionId);
+    const contribution = contributionId ? await Contribution.findById(contributionId) : null;
     
     const transactionNo = generateTransactionNo();
     const receiptNo = `RCT-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
@@ -561,6 +568,7 @@ app.post('/api/payments', authenticate, async (req, res) => {
     });
 
   } catch (error) {
+    console.error('Payment error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -628,6 +636,9 @@ app.get('/api/dashboard', authenticate, async (req, res) => {
 
     } else if (role === 'teacher') {
       const teacher = await User.findById(userId);
+      if (!teacher) {
+        return res.status(404).json({ error: 'Teacher not found' });
+      }
       const students = await Student.find({ 
         className: teacher.classId,
         isActive: true 
@@ -645,8 +656,11 @@ app.get('/api/dashboard', authenticate, async (req, res) => {
 
     } else if (role === 'parent') {
       const parent = await User.findById(userId);
+      if (!parent) {
+        return res.status(404).json({ error: 'Parent not found' });
+      }
       const students = await Student.find({ 
-        _id: { $in: parent.childrenIds },
+        _id: { $in: parent.childrenIds || [] },
         isActive: true 
       });
       
@@ -654,7 +668,7 @@ app.get('/api/dashboard', authenticate, async (req, res) => {
         children: students,
         totalBalance: students.reduce((sum, s) => sum + (s.balance || 0), 0),
         recentPayments: await Transaction.find({
-          studentId: { $in: parent.childrenIds }
+          studentId: { $in: parent.childrenIds || [] }
         }).sort({ transactionDate: -1 }).limit(10)
       };
     }
@@ -662,6 +676,7 @@ app.get('/api/dashboard', authenticate, async (req, res) => {
     res.json(stats);
 
   } catch (error) {
+    console.error('Dashboard error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -707,3 +722,4 @@ app.listen(PORT, () => {
 });
 
 module.exports = app;
+
