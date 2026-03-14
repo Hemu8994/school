@@ -28,7 +28,7 @@ export default function Login({ onLogin }) {
 
     setLoading(true);
     try {
-      const response = await fetch('https://your-backend-url.com/api/login', {
+      const response = await fetch('https://school-backend-bv22.onrender.com/api/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ phone, pin })
