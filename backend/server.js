@@ -9,10 +9,49 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// MongoDB Connection
-mongoose.connect(process.env.MONGODB_URI)
-  .then(() => console.log('✅ Connected to MongoDB'))
-  .catch(err => console.error('❌ MongoDB connection error:', err));
+// ==================== MongoDB Connection with Retry Logic ====================
+const connectWithRetry = async () => {
+  const MONGODB_URI = process.env.MONGODB_URI;
+  
+  if (!MONGODB_URI) {
+    console.error('❌ MONGODB_URI not found in environment variables');
+    process.exit(1);
+  }
+
+  const options = {
+    serverSelectionTimeoutMS: 5000,
+    socketTimeoutMS: 45000,
+    connectTimeoutMS: 10000,
+    maxPoolSize: 10,
+    minPoolSize: 2,
+    retryWrites: true,
+    retryReads: true,
+    maxIdleTimeMS: 30000,
+    autoIndex: false,
+  };
+
+  try {
+    await mongoose.connect(MONGODB_URI, options);
+    console.log('✅ Connected to MongoDB');
+    
+    mongoose.connection.on('error', (err) => {
+      console.error('❌ MongoDB connection error:', err);
+    });
+
+    mongoose.connection.on('disconnected', () => {
+      console.log('⚠️ MongoDB disconnected. Attempting to reconnect...');
+      setTimeout(connectWithRetry, 5000);
+    });
+
+  } catch (error) {
+    console.error('❌ MongoDB connection failed:', error.message);
+    console.log('🔄 Retrying in 5 seconds...');
+    setTimeout(connectWithRetry, 5000);
+  }
+};
+
+// Call the connection function
+connectWithRetry();
 
 // ==================== SCHEMAS ====================
 
@@ -71,7 +110,7 @@ const studentSchema = new mongoose.Schema({
 
 const Student = mongoose.model('Student', studentSchema);
 
-// Contribution Schema (Admin managed)
+// Contribution Schema
 const contributionSchema = new mongoose.Schema({
   name: { type: String, required: true },
   nameEn: String,
@@ -149,15 +188,26 @@ app.post('/api/login', async (req, res) => {
   try {
     const { phone, pin } = req.body;
 
-    const user = await User.findOne({ phone, isActive: true });
+    // Trim phone number to remove any spaces
+    const cleanPhone = phone.trim();
+    
+    console.log(`Login attempt for phone: ${cleanPhone}`);
+
+    const user = await User.findOne({ phone: cleanPhone, isActive: true });
     if (!user) {
+      console.log(`User not found for phone: ${cleanPhone}`);
       return res.status(401).json({ error: 'Namba ya simu haipo / Phone not registered' });
     }
 
+    console.log(`User found: ${user.name}, comparing PIN...`);
+    
     const isValid = await user.comparePin(pin);
     if (!isValid) {
+      console.log(`Invalid PIN for user: ${user.name}`);
       return res.status(401).json({ error: 'PIN si sahihi / Wrong PIN' });
     }
+
+    console.log(`Login successful for: ${user.name}`);
 
     user.lastLogin = new Date();
     await user.save();
@@ -211,11 +261,87 @@ app.post('/api/login', async (req, res) => {
     });
 
   } catch (error) {
+    console.error('Login error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Register (Admin only - protect this in production)
+// ==================== DEBUG ROUTE - REMOVE AFTER TESTING ====================
+app.post('/api/debug-login', async (req, res) => {
+  try {
+    const { phone, pin } = req.body;
+    
+    const cleanPhone = phone.trim();
+    
+    // Find ALL users to see what's in DB
+    const allUsers = await User.find({});
+    
+    // Find specific user
+    const user = await User.findOne({ phone: cleanPhone });
+    
+    let pinMatch = false;
+    let pinError = null;
+    
+    if (user) {
+      try {
+        pinMatch = await bcrypt.compare(pin, user.pin);
+      } catch (err) {
+        pinError = err.message;
+      }
+    }
+    
+    res.json({
+      searchedPhone: cleanPhone,
+      userFound: !!user,
+      pinMatches: pinMatch,
+      pinError: pinError,
+      userDetails: user ? {
+        id: user._id,
+        name: user.name,
+        phone: user.phone,
+        role: user.role,
+        pinHash: user.pin.substring(0, 20) + '...',
+        isActive: user.isActive
+      } : null,
+      allUsersInDb: allUsers.map(u => ({
+        phone: u.phone,
+        name: u.name,
+        role: u.role,
+        pinHash: u.pin.substring(0, 15) + '...'
+      }))
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Temporary route to fix PINs if needed
+app.post('/api/fix-pin/:phone', async (req, res) => {
+  try {
+    const { phone } = req.params;
+    const { newPin } = req.body;
+    
+    const user = await User.findOne({ phone });
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    // Hash the new PIN
+    const hashedPin = await bcrypt.hash(newPin || '1234', 10);
+    user.pin = hashedPin;
+    await user.save();
+    
+    res.json({
+      success: true,
+      message: `PIN updated for ${user.name}`,
+      newHash: hashedPin.substring(0, 20) + '...'
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Register (Admin only)
 app.post('/api/register', async (req, res) => {
   try {
     const { phone, pin, name, role, classId, childrenIds } = req.body;
@@ -242,7 +368,7 @@ app.post('/api/register', async (req, res) => {
   }
 });
 
-// ==================== CONTRIBUTION ROUTES (Admin only) ====================
+// ==================== CONTRIBUTION ROUTES ====================
 
 // Get all contributions
 app.get('/api/contributions', async (req, res) => {
@@ -300,7 +426,6 @@ app.get('/api/students', authenticate, async (req, res) => {
     const { class: className, search } = req.query;
     let query = { isActive: true };
 
-    // Role-based filtering
     if (req.user.role === 'teacher') {
       const teacher = await User.findById(req.user.userId);
       query.className = teacher.classId;
@@ -341,7 +466,6 @@ app.get('/api/students/:id', authenticate, async (req, res) => {
 // Add student (Admin only)
 app.post('/api/students', authenticate, isAdmin, async (req, res) => {
   try {
-    // Generate admission number
     const count = await Student.countDocuments();
     const admissionNumber = `ADM-${new Date().getFullYear()}-${(count + 1).toString().padStart(4, '0')}`;
     
@@ -391,7 +515,6 @@ app.post('/api/payments', authenticate, async (req, res) => {
 
     const contribution = await Contribution.findById(contributionId);
     
-    // Create transaction
     const transactionNo = generateTransactionNo();
     const receiptNo = `RCT-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
     
@@ -412,7 +535,6 @@ app.post('/api/payments', authenticate, async (req, res) => {
 
     await transaction.save();
 
-    // Update student
     student.balance = (student.balance || 0) - amount;
     student.payments.push({
       amount,
@@ -478,12 +600,10 @@ app.get('/api/dashboard', authenticate, async (req, res) => {
     let stats = {};
 
     if (role === 'principal' || role === 'admin') {
-      // Full school stats
       const students = await Student.countDocuments({ isActive: true });
       const completedTxns = await Transaction.find({ status: 'completed' });
       const totalCollected = completedTxns.reduce((sum, t) => sum + t.amount, 0);
       
-      // Class breakdown
       const classes = ['Form 1A','Form 1B','Form 2A','Form 2B','Form 3A','Form 3B','Form 4A','Form 4B'];
       const classStats = await Promise.all(classes.map(async (className) => {
         const classStudents = await Student.find({ className, isActive: true });
@@ -554,7 +674,8 @@ app.get('/api/health', (req, res) => {
     status: 'OK', 
     message: 'Server is running',
     timestamp: new Date(),
-    environment: process.env.NODE_ENV || 'development'
+    environment: process.env.NODE_ENV || 'development',
+    mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected'
   });
 });
 
@@ -563,6 +684,8 @@ app.get('/api/classes', (req, res) => {
   const classes = ['Form 1A','Form 1B','Form 2A','Form 2B','Form 3A','Form 3B','Form 4A','Form 4B'];
   res.json(classes);
 });
+
+// ==================== ERROR HANDLING ====================
 
 // Error handling middleware
 app.use((err, req, res, next) => {
@@ -580,7 +703,7 @@ const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📱 Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`🔗 MongoDB: ${process.env.MONGODB_URI ? 'Connected' : 'Not connected'}`);
+  console.log(`🔗 MongoDB: ${mongoose.connection.readyState === 1 ? 'Connected' : 'Disconnected'}`);
 });
 
 module.exports = app;
